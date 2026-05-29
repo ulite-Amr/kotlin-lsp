@@ -260,6 +260,57 @@ impl Backend {
                     )
                     .await;
             }
+        } else if params.command == "editor.action.goToLocations" {
+            if let Some(locations) = params.arguments.get(2) {
+                if let Some(locs) = locations.as_array() {
+                    if let Some(first) = locs.first() {
+                        let uri_str = first.get("uri").and_then(|v| v.as_str());
+                        let range_obj = first.get("range");
+                        if let (Some(uri_str), Some(range_obj)) = (uri_str, range_obj) {
+                            if let Ok(uri) = Url::parse(uri_str) {
+                                let start = range_obj.get("start");
+                                let end = range_obj.get("end");
+                                let selection = match (start, end) {
+                                    (Some(s), Some(e)) => {
+                                        let sl = s.get("line").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            as u32;
+                                        let sc = s
+                                            .get("character")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as u32;
+                                        let el = e.get("line").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            as u32;
+                                        let ec = e
+                                            .get("character")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            as u32;
+                                        Some(Range {
+                                            start: Position {
+                                                line: sl,
+                                                character: sc,
+                                            },
+                                            end: Position {
+                                                line: el,
+                                                character: ec,
+                                            },
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                let params = ShowDocumentParams {
+                                    uri,
+                                    external: Some(false),
+                                    take_focus: Some(true),
+                                    selection,
+                                };
+                                let _ = self.client.show_document(params).await;
+                            }
+                        }
+                    }
+                }
+            }
         }
         Ok(None)
     }
@@ -434,7 +485,11 @@ fn server_capabilities() -> ServerCapabilities {
         }),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec!["kotlin-lsp/reindex".into(), "kotlin-lsp/clearCache".into()],
+            commands: vec![
+                "kotlin-lsp/reindex".into(),
+                "kotlin-lsp/clearCache".into(),
+                "editor.action.goToLocations".into(),
+            ],
             ..Default::default()
         }),
         rename_provider: Some(OneOf::Right(RenameOptions {
@@ -447,6 +502,9 @@ fn server_capabilities() -> ServerCapabilities {
             trigger_characters: Some(vec!["(".into(), ",".into()]),
             retrigger_characters: None,
             work_done_progress_options: Default::default(),
+        }),
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(false),
         }),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
@@ -753,6 +811,18 @@ impl LanguageServer for Backend {
                     &params.range,
                 ),
             )))
+        })
+        .await
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        panic_safe("code_lens", async {
+            let uri = params.text_document.uri;
+            if crate::Language::from_path(uri.path()) != crate::Language::Kotlin {
+                return Ok(None);
+            }
+            let lenses = crate::features::code_lens::compute_code_lens(&self.indexer, &uri);
+            Ok(Some(lenses))
         })
         .await
     }

@@ -15,6 +15,7 @@
 
 pub(crate) mod call_arg_diagnostics;
 pub(crate) mod code_actions;
+pub(crate) mod code_lens;
 pub(crate) mod completion;
 pub(crate) mod definition;
 pub(crate) mod fill_when;
