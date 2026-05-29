@@ -9,6 +9,7 @@ use crate::backend::helpers::syntax_diagnostics;
 use crate::features::call_arg_diagnostics::call_arg_diagnostics;
 use crate::features::code_actions::missing_package_diagnostic;
 use crate::features::fill_when::when_diagnostics;
+use crate::features::kmp_expect_diagnostics::kmp_expect_diagnostics;
 use crate::indexer::live_tree::{lang_for_path, parse_live};
 use crate::indexer::{Indexer, ProgressReporter};
 
@@ -146,14 +147,17 @@ impl DocumentHandler {
             let live_doc = lang_for_path(diagnostics_uri.path())
                 .and_then(|lang| parse_live(&diagnostics_text, lang));
 
-            let mut diagnostics = match result {
-                Ok(Some(indexed_file_data)) => syntax_diagnostics(&indexed_file_data.syntax_errors),
-                Ok(None) => diag_indexer
+            let result_ref = result
+                .as_ref()
+                .ok()
+                .and_then(|opt| opt.as_ref().map(|arc| arc.as_ref()));
+            let mut diagnostics = match result_ref {
+                Some(data) => syntax_diagnostics(&data.syntax_errors),
+                None => diag_indexer
                     .files
                     .get(diagnostics_uri.as_str())
                     .map(|file_data| syntax_diagnostics(&file_data.syntax_errors))
                     .unwrap_or_default(),
-                Err(_) => Vec::new(),
             };
             // Skip semantic diagnostics while the workspace scan is still in
             // progress — the index is partial and would produce false positives
@@ -174,10 +178,52 @@ impl DocumentHandler {
             if let Some(pkg_diag) = missing_package_diagnostic(&diag_lines, &diagnostics_uri) {
                 diagnostics.push(pkg_diag);
             }
-            if let Some(client) = client {
+            if let Some(client) = client.as_ref() {
                 client
-                    .publish_diagnostics(diagnostics_uri, diagnostics, None)
+                    .publish_diagnostics(diagnostics_uri.clone(), diagnostics, None)
                     .await;
+            }
+            // KMP diagnostics published separately so a slow
+            // kmp_expect_diagnostics never blocks fast diagnostics.
+            if !diag_indexer.indexing_in_progress.load(Ordering::Acquire) {
+                if let Some(ref doc) = live_doc {
+                    let kmp_diags =
+                        kmp_expect_diagnostics(&diag_indexer, &diagnostics_uri, doc);
+                    if !kmp_diags.is_empty() {
+                        let mut all_diags = match result_ref {
+                            Some(data) => syntax_diagnostics(&data.syntax_errors),
+                            None => diag_indexer
+                                .files
+                                .get(diagnostics_uri.as_str())
+                                .map(|file_data| {
+                                    syntax_diagnostics(&file_data.syntax_errors)
+                                })
+                                .unwrap_or_default(),
+                        };
+                        all_diags.extend(when_diagnostics(
+                            &diag_indexer,
+                            &diagnostics_uri,
+                        ));
+                        if let Some(ref doc) = live_doc {
+                            all_diags.extend(call_arg_diagnostics(
+                                &diag_indexer,
+                                &diagnostics_uri,
+                                doc,
+                            ));
+                        }
+                        all_diags.extend(kmp_diags);
+                        if let Some(pkg_diag) =
+                            missing_package_diagnostic(&diag_lines, &diagnostics_uri)
+                        {
+                            all_diags.push(pkg_diag);
+                        }
+                        if let Some(client) = client {
+                            client
+                                .publish_diagnostics(diagnostics_uri, all_diags, None)
+                                .await;
+                        }
+                    }
+                }
             }
         });
     }
@@ -212,8 +258,38 @@ impl DocumentHandler {
                 if let Some(pkg_diag) = missing_package_diagnostic(&lines, &uri) {
                     diagnostics.push(pkg_diag);
                 }
-                if let Some(client) = client {
-                    client.publish_diagnostics(uri, diagnostics, None).await;
+                if let Some(ref client) = client {
+                    client
+                        .publish_diagnostics(uri.clone(), diagnostics, None)
+                        .await;
+                }
+                // KMP diagnostics published separately
+                if let Some(doc) = indexer.live_doc(&uri) {
+                    let kmp_diags = kmp_expect_diagnostics(&indexer, &uri, &doc);
+                    if !kmp_diags.is_empty() {
+                        let mut all_diags = indexer
+                            .files
+                            .get(uri.as_str())
+                            .map(|f| syntax_diagnostics(&f.syntax_errors))
+                            .unwrap_or_default();
+                        all_diags.extend(when_diagnostics(&indexer, &uri));
+                        if let Some(doc) = indexer.live_doc(&uri) {
+                            all_diags.extend(call_arg_diagnostics(
+                                &indexer, &uri, &doc,
+                            ));
+                        }
+                        all_diags.extend(kmp_diags);
+                        if let Some(pkg_diag) =
+                            missing_package_diagnostic(&lines, &uri)
+                        {
+                            all_diags.push(pkg_diag);
+                        }
+                        if let Some(client) = client {
+                            client
+                                .publish_diagnostics(uri, all_diags, None)
+                                .await;
+                        }
+                    }
                 }
             });
         }

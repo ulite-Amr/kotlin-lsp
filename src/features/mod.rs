@@ -23,6 +23,7 @@ pub(crate) mod folding;
 pub(crate) mod highlight;
 pub(crate) mod hover;
 pub(crate) mod implementation;
+pub(crate) mod kmp_expect_diagnostics;
 pub(crate) mod references;
 pub(crate) mod rename;
 pub(crate) mod signature_help;

@@ -9,6 +9,7 @@ use tower_lsp::Client;
 use crate::backend::helpers::syntax_diagnostics;
 use crate::features::call_arg_diagnostics::call_arg_diagnostics;
 use crate::features::fill_when::when_diagnostics;
+use crate::features::kmp_expect_diagnostics::kmp_expect_diagnostics;
 use crate::indexer::live_tree::{lang_for_path, parse_live};
 use crate::indexer::Indexer;
 
@@ -161,14 +162,18 @@ impl FileChangeHandler {
                 },
                 diagnostics_uri.path(),
             );
-            let mut diagnostics = match result {
-                Ok(Some(data)) => syntax_diagnostics(&data.syntax_errors),
-                Ok(None) => diag_indexer
+            let result_ref = result
+                .as_ref()
+                .ok()
+                .and_then(|opt| opt.as_ref().map(|arc| arc.as_ref()));
+            let mut diagnostics = match result_ref {
+                Some(data) => syntax_diagnostics(&data.syntax_errors),
+                None => diag_indexer
                     .files
                     .get(diagnostics_uri.as_str())
                     .map(|file_data| syntax_diagnostics(&file_data.syntax_errors))
                     .unwrap_or_default(),
-                Err(_) => Vec::new(),
+                None => Vec::new(),
             };
             diagnostics.extend(when_diagnostics(&diag_indexer, &diagnostics_uri));
             if let Some(ref doc) = live_doc {
@@ -193,8 +198,36 @@ impl FileChangeHandler {
             }
 
             client
-                .publish_diagnostics(diagnostics_uri, diagnostics, None)
+                .publish_diagnostics(diagnostics_uri.clone(), diagnostics, None)
                 .await;
+
+            // Slow KMP diagnostics published separately so a slow
+            // kmp_expect_diagnostics never blocks syntax/when/call_arg.
+            if let Some(ref doc) = live_doc {
+                let kmp_diags = kmp_expect_diagnostics(&diag_indexer, &diagnostics_uri, doc);
+                if !kmp_diags.is_empty() {
+                    if generation.load(Ordering::Acquire) == my_generation {
+                        let mut all_diags = match result_ref {
+                            Some(data) => syntax_diagnostics(&data.syntax_errors),
+                            None => diag_indexer
+                                .files
+                                .get(diagnostics_uri.as_str())
+                                .map(|file_data| syntax_diagnostics(&file_data.syntax_errors))
+                                .unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        all_diags.extend(when_diagnostics(&diag_indexer, &diagnostics_uri));
+                        if let Some(live_doc) = diag_indexer.live_doc(&diagnostics_uri) {
+                            all_diags
+                                .extend(call_arg_diagnostics(&diag_indexer, &diagnostics_uri, &live_doc));
+                        }
+                        all_diags.extend(kmp_diags);
+                        client
+                            .publish_diagnostics(diagnostics_uri, all_diags, None)
+                            .await;
+                    }
+                }
+            }
         });
         self.pending_reindex.insert(key, handle);
     }
